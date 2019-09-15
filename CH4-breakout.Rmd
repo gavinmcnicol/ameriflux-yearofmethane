@@ -1,0 +1,469 @@
+---
+title: "AmeriFlux Early Career Workshop"
+output: html_notebook
+---
+
+  September 17, 2019
+  
+  Gavin McNicol
+  
+## Methane Data Tutorial
+Hi *Methanophiliacs*
+
+The introductory tutorial will cover:
+
+* Playing with half-hourly CH4 data (no high-frequency processing)
+* Implementing two common gap-filling approaches: MDS (look up table) and machine learning algorithms (random forest)
+
+The breakout projects can explore:
+
+* Interpreting gap-filling performance at your site(s) 
+* Interpreting predictive variable importance at your site(s)
+* Exploring more sophistocated gap-simulation methods (we can discuss Dengel et al. 2013)
+* Implementing artificial neural networks in R (from Python/MATLAB code)
+
+First let's clear the workspace and load packages to manipulate and vizualize some methane site tower data.
+```{r}
+# clear workspace
+rm(list=ls())
+
+library(tidyverse) # easy data-structure manipulation
+library(ggplot2) # nice, quick plots
+library(caret) # wrapper package for multiple machine learning algorithms
+library(ranger) # random forest package
+library(lubridate) # for easy date format conversion
+```
+Set your working directory to the location you have stored the data for today, and read in the .csv file.
+```{r message=FALSE, warning=FALSE}
+setwd("/Users/macbook/Box Sync/Stanford/Meetings/AmeriFlux PI 2019/EC Workshop/Data")
+data <- read_csv(file.choose(), skip = 2) # first two rows are metadata
+```
+The data loaded above is from AmeriFlux Mediterranean marsh site [US-Myb](https://ameriflux.lbl.gov/sites/siteinfo/US-Myb). Click the link for more site info.
+
+It's a great site to work with because it has:
+
+* A long, 9-year CH4 record (late 2010-2019)
+* It has good data coverage, and no very long gaps (e.g., winter-time shut down in the Arctic)
+* I am biased ;) This was my fieldsite for my PhD
+
+Let's take a look at the data variables with glimpse().
+```{r}
+glimpse(data)
+```
+### A few things to notice:
+
+* -9999 is used in place of NA for missing data
+* TS_PI_1 through TS_PI_5 refers to a single vertical profile of soil temp., going from shallow to deep
+* _PI_F is gap-filled variable, filled by the PI themselves. We can compare our results to this later.
+* Standard variables such as WD/S (wind direction/speed), PA (air pressure), and RH (relative humidity) etc., are here. 
+Note: the full list of standardized AmeriFlux BASE variable names are listed here.
+
+### Let's simplify the dataset to:
+* Convert TIMESTAMP into Year, DOY, HHMM
+* Select the key variables we want for gap-filling 
+* Keep the PI based gap-filling CH4_PI_F (using MDS)
+* Convert -9999 to NAs (to allow for plotting)
+* Filter out first and last year of data (2010, 2019) due to very long 'gaps'
+
+**Note**, we select the _PI_F gap-filled variables, except FCH4, and only the shallowest soil temp.
+
+```{r}
+ml.data <- data %>% 
+  mutate(Year = as.integer(substr(TIMESTAMP_START,1,4)),
+         Date = paste(substr(TIMESTAMP_START,1,4),"-",
+                      substr(TIMESTAMP_START,5,6),"-",
+                      substr(TIMESTAMP_START,7,8), sep = ""),
+         Date = as.Date(Date, format = "%Y-%m-%d"),
+         DOY = yday(Date),
+         HHMM =  as.factor(substr(TIMESTAMP_START,9,12))) %>%
+  select(Year, DOY, HHMM, FCH4, FCH4_PI_F, 
+         H = H_PI_F, LE = LE_PI_F, PA, TA, RH, NETRAD, WS, P, GPP = GPP_PI_F, RECO = RECO_PI_F, USTAR = USTAR,
+         WTD, TS = TS_PI_1) %>% 
+  mutate_all(~ na_if(., -9999)) %>% 
+  filter(Year > 2010 & Year < 2019) %>% 
+  mutate(Year = factor(Year)) 
+
+```
+### Playing with the data
+Let's look at the methane time-series data, relationships with other variables, and the PI gap filling.
+
+Start with a plot of the half-hourly methane data
+```{r}
+# some code to set up mytheme (feel free to adjust as you like)
+mytheme <- theme_bw() +
+  theme(panel.border = element_blank(), 
+        axis.title=element_text(size=14), axis.text=element_text(size=10),
+        panel.grid.major = element_blank(), 
+        panel.grid.minor = element_blank(), 
+        axis.line = element_line(colour = "black")) +
+    theme(strip.text = element_text(face="bold", size=12),
+        strip.background = element_rect(fill='grey', colour='black',size=1)) 
+
+ml.data %>% 
+  ggplot(aes(DOY, FCH4, colour = Year)) +
+  geom_point(size = 0.2) + 
+  facet_wrap(~Year, ncol = 4) +
+  labs(x= 'DOY', y = expression(CH[4]*' Flux (nmol m'^{-2}*' s'^{-1}*')')) + 
+  mytheme 
+  
+```
+### Plotting relationships with a couple of key driving variables: 
+
+* Temperature
+* GPP (gross primary productivity)
+* Latent heat (found to be important at this site, Sturtevant et al. 2016)
+```{r}
+# first summarize daily means
+ml.data.daily <- ml.data %>% 
+  group_by(Year, DOY) %>% 
+  summarize_all(~ mean(., na.rm = TRUE))
+```
+Now plot temperature response:
+```{r}
+ml.data.daily %>% 
+  ggplot(aes(TA, FCH4, colour = Year)) +
+  geom_point(size = 0.2) + 
+  facet_wrap(~Year, ncol = 3) +
+  labs(x= expression('Temperature ('*degree*'C)'), y = expression(CH[4]*' Flux (nmol m'^{-2}*' s'^{-1}*')')) +
+  mytheme
+```
+Now GPP:
+```{r}
+ml.data %>% 
+  group_by(Year, DOY) %>% 
+  summarize_all(~ mean(., na.rm = TRUE)) %>% 
+  ggplot(aes(GPP, FCH4, colour = Year)) +
+  geom_point(size = 0.2) + 
+  facet_wrap(~Year, ncol = 3) +
+  labs(x= expression(GPP *'('*mu*'mol m'^{-2}*' s'^{-1}*')'), y = expression(CH[4]*' Flux (nmol m'^{-2}*' s'^{-1}*')')) +
+  mytheme
+```
+Now latent heat:
+```{r}
+ml.data %>% 
+  group_by(Year, DOY) %>% 
+  summarize_all(~ mean(., na.rm = TRUE)) %>% 
+  ggplot(aes(LE, FCH4, colour = Year)) +
+  geom_point(size = 0.2) + 
+  facet_wrap(~Year, ncol = 3) +
+  labs(x= expression('Latent Heat Flux (W m'^{-2}*')'), y = expression(CH[4]*' Flux (nmol m'^{-2}*' s'^{-1}*')')) +
+  mytheme
+```
+
+
+### Looking at gap-filled timeseries
+
+Now let's take a look at a short period (30 days), first without the PI gap-fill:
+```{r}
+vars <- c("FCH4"="black", "FCH4_PI_F"="red") # allows displaying legend
+ml.data %>% 
+  filter(Year == 2014 & DOY > 270 & DOY < 300) %>% 
+  mutate(index = 1:n()) %>% # make a temporary index variable, to plot consecutive half-hours
+    ggplot() +
+      geom_point(aes(index, FCH4,  col = 'FCH4'), size = 1) + 
+      scale_colour_manual(name="Data", values=vars) +
+      scale_x_continuous(labels = c(seq(270,299, by = 3)), breaks = c(seq(0,29*48,48*3))) +
+      labs(x= 'DOY', y = expression(CH[4]*' Flux (nmol m'^{-2}*' s'^{-1}*')')) +
+  mytheme
+```
+Now with the PI gap-fill:
+```{r}
+ml.data %>% 
+  filter(Year == 2014 & DOY > 270 & DOY < 300) %>% 
+  mutate(index = 1:n()) %>% # make a temporary index variable, to plot consecutive half-hours
+    ggplot() +
+      geom_point(aes(index, FCH4,  col = 'FCH4'), size = 1) + 
+      geom_point(aes(index, FCH4_PI_F, col ='FCH4_PI_F'), size = 1, alpha = 0.3) +
+      scale_colour_manual(name="Data", values=vars) +
+      scale_x_continuous(labels = c(seq(270,299, by = 3)), breaks = c(seq(0,29*48,48*3))) +
+      labs(x= 'DOY', y = expression(CH[4]*' Flux (nmol m'^{-2}*' s'^{-1}*')')) +
+  mytheme
+```
+You can see here that **FCH4_PI_F** is a complete time-series, with both measured fluxes and gap-filled fluxes.
+
+We can do a quick evaluation of gap-filling performance over this interval with:
+```{r}
+ml.data %>% 
+  filter(Year == 2014 & DOY > 270 & DOY < 300) %>% 
+  filter(FCH4 != FCH4_PI_F) %>%        # here we have to remove where measured flux was substituted for gap-filled data (which shows a 1:1 line)
+    ggplot() +
+      geom_point(aes(FCH4, FCH4_PI_F), size = 1) + 
+      scale_colour_manual(name="Data", values=vars) +
+      labs(x= expression('FCH4 (nmol m'^{-2}*' s'^{-1}*')'), y = expression('FCH4_PI_F (nmol m'^{-2}*' s'^{-1}*')')) +
+  mytheme
+```
+There is a lot of scatter in this 30 day window. Not the best!
+
+We can also calculate an R2 and a Nash Sutcliffe score to confirm low gap-filling accuracy quantitatively:
+```{r}
+ml.data %>% 
+  filter(Year == 2014 & DOY > 270 & DOY < 300) %>% 
+  filter(FCH4 != FCH4_PI_F) %>%    
+    summarize(Rsquared = summary(lm(FCH4_PI_F ~ FCH4))$adj.r.squared,
+              NSE = 1 - sum((FCH4 - FCH4_PI_F)^2) / sum((FCH4 - mean(FCH4))^2))
+```
+
+### Characterizing the gaps
+We can look at a few simple descriptive statistics:
+
+* How many missing half-hours are there?
+* How many gaps are there each year? (many gaps are multiple half-hours in length) 
+* What is mean and median gap length, and gap-length empirical distribution? **Breakout activity**
+
+
+```{r}
+ml.data.length <- length(ml.data$Year) # to get total number of half-hours in US-Myb dataset
+ml.data %>% 
+  mutate(index = 1) %>% 
+  filter(is.na(FCH4)) %>% 
+  select(index) %>% pull() %>% sum()/ml.data.length*100 
+```
+Almost 22% of the entire 10 year time series is missing FCH4 data.
+
+```{r}
+ml.data.length <- length(ml.data$Year) # to get total number of half-hours in US-Myb dataset
+ml.data %>% 
+  group_by(Year) %>% 
+  mutate(index = 1) %>% 
+  filter(is.na(FCH4)) %>% 
+  summarize(halfhours_missing = sum(index)/(365*48/100)) 
+```
+
+Between 15% and 33% of data are missing each year.
+
+We can't train the model with missing FCH4, so lets remove NAs.
+
+```{r}
+ml.data <- ml.data %>% 
+  filter(!is.na(FCH4))
+```
+
+
+### Start Gap-Filling Process
+
+The first thing is to finalize the variables we want to use as predictors. 
+So far we have 13:
+
+* FCH4 (response variable / label in ML language)
+* H, LE, GPP, RECO (4 fluxes)
+* PA, TA, RH, NETRAD, WS, P, USTAR (7 micrometeorology)
+* WTD, TS (2 soil/water column properties)
+
+You can check these with names()
+```{r}
+names(ml.data)
+```
+
+### Seasonality variables
+In addition to the micromet. measurements at the tower, a simple seasonality index has also proven useful as a predictor.
+
+We can create this using a s = sine and c = cosine function throughout the year.
+
+```{r}
+ml.data <- ml.data %>% 
+  mutate(sin_ = sin((DOY-1)/365*2*pi),
+         cos_ = cos((DOY-1)/365*2*pi))
+
+# # some code if you want to look at the cos_ or sin_ variables
+# ml.data %>% 
+#   ggplot(aes(DOY, cos_)) +
+#   geom_point()
+```
+
+### Preprocessing: Imputing missing predictor data
+Machine learning algorithms need complete cases to be trained. That means there can't be any missing values in the predictor data.
+Let's summarize the missing data in the predictors:
+```{r}
+ml.data %>% 
+  group_by(Year) %>% 
+  summarize_all(~ sum(is.na(.))/n()*100)
+```
+
+You can also see that significant amounts of data are missing from some of the predictors.
+
+We have a few options including:
+ 
+ * Median imputation
+ * Bagged imputation
+ * More complex gap-filling
+ 
+Because there are extended periods and we want a simple approach we can use the caret package's baggedImpute function here.
+
+We also don't want to impute using FCH4, so we remove it and FCH4_PI_F.
+
+```{r}
+ml.data.x <- ml.data %>% 
+                select(-FCH4, -FCH4_PI_F)
+ml.data.y <- ml.data %>% 
+                select(FCH4)
+x.names <- names(ml.data.x)[4:18]
+
+# preprocess (using caret)
+pp <- preProcess(ml.data.x, method = c("bagImpute")) # run the bagimputation, may take a couple of minutes
+ml.data.x.pp <- predict(pp, ml.data.x) # now predict values with trained model
+
+# fill NAs in original training set using the imputed values and save the file 
+ml.data[x.names] <- 
+  ml.data.x.pp[x.names]
+
+# quick plots to check if imputation looks reasonable
+ml.data %>%
+  ggplot(aes(DOY, TS)) +
+  geom_point() +
+  scale_y_continuous() +
+  facet_wrap(~Year, ncol = 4)
+
+# if you want to check, go back to previous chunk to quantify NAs again.
+```
+
+### Creating train/val/test data
+Now that the features (predictor variables) are selected and filled, we need to split the data into a train and test set.
+
+Let's try a  75/25 train/test split. We'll use k-fold cross-validation too, which means that the data used for training will be internally evaluated against internal folds of the data before we do a final evaluation on the test data.
+
+First lets set a random seed, for reproducability, and split off the test data. **Note** Also decided to subest only 2012 data to make model train faster:
+```{r}
+set.seed(23)
+
+# shuffle data 
+ml.data <- ml.data %>% 
+  filter(Year == 2012) %>% 
+  mutate(row = 1:n(),
+         rrow = sample(row)) %>% 
+  arrange(rrow) 
+
+# subset test data (25%)
+ml.test <- ml.data %>% 
+  filter(rrow < 0.25*length(rrow))
+
+# quick plot
+ml.train %>% 
+  ggplot(aes(DOY, FCH4)) +
+  geom_point() +
+  mytheme
+
+# subset train data (75%)
+ml.train <- ml.data %>% 
+  filter(rrow >= 0.25*length(rrow))
+
+# split into x and y data
+ml.train.x <- ml.train %>% 
+                select(-Year, -DOY, -HHMM, -FCH4, -FCH4_PI_F, -row, -rrow)
+ml.train.y <- ml.train %>% 
+                select(FCH4) %>% pull()
+
+```
+
+### Train Random Forest
+```{r}
+# Create tune-grid to search over hyperparameter combinations
+tgrid <- expand.grid(
+  .mtry = c(3,6,9,12),
+  .splitrule = "variance", 
+  .min.node.size = c(2,20,50,100)
+)
+
+# Create trainControl object
+myControl <- trainControl(
+  method = "cv",
+  number = 10,
+  classProbs = FALSE,
+  verboseIter = TRUE,
+  savePredictions = TRUE
+)
+
+# train rf 
+rf_model <- train(
+  x = ml.train.x, 
+  y = ml.train.y,
+  method = 'ranger',
+  trControl = myControl,
+  tuneGrid = tgrid,
+  num.trees = 100,
+  importance = 'permutation'
+  )
+
+# saveRDS(rf_model, "...your local directory pathname...")
+
+```
+### Predict held-out test data using model
+
+```{r}
+rf.pred <- ml.test %>% 
+    mutate(FCH4P = predict(rf_model, .)) %>% 
+  arrange(row)
+
+# quick plot
+rf.pred %>% 
+  ggplot(aes(FCH4, FCH4P)) +
+  geom_point() +
+  scale_x_continuous(limits = c(0,650)) +
+  scale_y_continuous(limits = c(0,650)) +
+  mytheme
+
+# calculate R2 & NSE
+rf.pred %>% 
+  summarize(Rsquared = summary(lm(FCH4P ~ FCH4))$adj.r.squared,
+            NSE = 1 - sum((FCH4 - FCH4P)^2) / sum((FCH4 - mean(FCH4))^2))
+```
+
+### Optional Breakout Coding Task
+Look at variable importance and dive into partial dependencies
+```{r}
+# simple rankings
+plot(varImp(rf_model, scale = FALSE), main="variable importance")
+
+
+pd <- rf_model %>% partial(pred.var = c("RECO"), train = ml.train, plot.engine = "ggplot2")
+# plot
+pd %>% 
+  ggplot(aes(TS, yhat)) +
+  geom_line() +
+  facet_wrap(~Year, ncol = 4) +
+  theme_bw() +
+  theme(panel.border = element_blank(), 
+        axis.title=element_text(size=14), axis.text=element_text(size=10),
+        panel.grid.major = element_blank(), 
+        panel.grid.minor = element_blank(), 
+        axis.line = element_line(colour = "black")) 
+```
+
+
+
+
+### Optional Breakout Coding Task
+If interested, try to translate this gap simulation [file:///Users/macbook/Downloads/gap_masking.html](Python code) into R.
+```{r}
+
+
+time_series <- ml.data$FCH4
+
+compute_gap_hist <- function(time_series, gap_value = NA, return_idx = FALSE) {
+    gap_len <- list()
+    idxs <- list()
+    count <- 0
+    for (i in 1:length(time_series)) {
+         # increment length counter on gaps
+        if (is.na(time_series[i])) {
+            count <- count + 1
+        }
+            # if the gap hits very end of array, add it
+            if (i == length(time_series) - 1){
+                  gap_len[[i]] <- gap_len[[i]] + count
+                  idxs[[i]] <- idxs[[i]] + (i - count)
+            } else {
+            # otherwise add the gap and reset when we hit a non-gap
+            if (count > 0) {
+                gap_len[[i]] <- gap_len[[i]] + count
+                idxs[[i]] <- idxs[[i]] + (i - count)
+                count <- 0
+            }
+              }
+    }
+}
+        
+
+compute_gap_hist(time_series)
+
+     
+```
